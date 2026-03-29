@@ -1,0 +1,5 @@
+{
+  "name": "Remix: 6.1班量化管理交互系统",
+  "description": "一个用于6.1班量化管理的交互系统，支持小组评分、跨组拖拽和个人实时排名。",
+  "requestFramePermissions": []
+}
