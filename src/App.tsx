@@ -1,86 +1,29 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { INITIAL_GROUPS, Group, Member, LogEntry } from './constants';
-import { Trophy, Download, RotateCcw, GripVertical, MoreVertical, UserCog, Send, FileSpreadsheet, History, Trash2, Clock, Save, Edit2, ChevronDown, ChevronUp, Plus, Minus, LogIn, LogOut, AlertCircle } from 'lucide-react';
+import { Trophy, Download, RotateCcw, GripVertical, MoreVertical, UserCog, Send, FileSpreadsheet, History, Trash2, Clock, Save, Edit2, ChevronDown, ChevronUp, Plus, Minus, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
 import { pinyin } from 'pinyin-pro';
-import { auth, db, googleProvider, signInWithPopup, signOut, onAuthStateChanged, doc, collection, onSnapshot, setDoc, addDoc, query, orderBy, limit, handleFirestoreError, OperationType, User, getDocFromServer, createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile } from './firebase';
 
 export default function App() {
-  const [currentGroups, setCurrentGroups] = useState<Group[]>(INITIAL_GROUPS);
-  const [user, setUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  const [currentGroups, setCurrentGroups] = useState<Group[]>(() => {
+    const saved = localStorage.getItem('class_quantization_groups');
+    return saved ? JSON.parse(saved) : INITIAL_GROUPS;
+  });
+  const [logs, setLogs] = useState<LogEntry[]>(() => {
+    const saved = localStorage.getItem('class_quantization_logs');
+    return saved ? JSON.parse(saved) : [];
+  });
   const [error, setError] = useState<string | null>(null);
   
-  // Email Auth State
-  const [isRegistering, setIsRegistering] = useState(false);
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [authSubmitting, setAuthSubmitting] = useState(false);
-
   const [draggedMemberInfo, setDraggedMemberInfo] = useState<{ groupId: number; memberIdx: number } | null>(null);
   const [dropTargetGroupId, setDropTargetGroupId] = useState<number | null>(null);
   const [movingMember, setMovingMember] = useState<{ groupId: number; memberIdx: number } | null>(null);
   const [activeSelectGroup, setActiveSelectGroup] = useState<number | null>(null);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLogExpanded, setIsLogExpanded] = useState(false);
   const [viewingLogId, setViewingLogId] = useState<string>('current');
   const [newMemberName, setNewMemberName] = useState('');
   const [selectedGroupIdForNewMember, setSelectedGroupIdForNewMember] = useState<number | ''>('');
-
-  // Auth Listener
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setAuthLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  // Firestore Connection Test
-  useEffect(() => {
-    async function testConnection() {
-      try {
-        await getDocFromServer(doc(db, 'state', 'connection_test'));
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('the client is offline')) {
-          setError("无法连接到数据库，请检查网络或配置。");
-        }
-      }
-    }
-    testConnection();
-  }, []);
-
-  // Firestore Listeners
-  useEffect(() => {
-    if (!user) return;
-
-    const unsubscribe = onSnapshot(doc(db, 'state', 'current'), (snapshot) => {
-      if (snapshot.exists()) {
-        setCurrentGroups(snapshot.data().groups);
-      } else {
-        // Initialize if empty
-        saveData(INITIAL_GROUPS);
-      }
-    }, (err) => {
-      handleFirestoreError(err, OperationType.GET, 'state/current');
-    });
-    return () => unsubscribe();
-  }, [user]);
-
-  useEffect(() => {
-    if (!user) return;
-
-    const q = query(collection(db, 'logs'), orderBy('timestamp', 'desc'), limit(100));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const newLogs = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as LogEntry));
-      setLogs(newLogs);
-    }, (err) => {
-      handleFirestoreError(err, OperationType.LIST, 'logs');
-    });
-    return () => unsubscribe();
-  }, [user]);
 
   // Close menus when clicking outside
   useEffect(() => {
@@ -95,6 +38,15 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  // Sync to localStorage
+  useEffect(() => {
+    localStorage.setItem('class_quantization_groups', JSON.stringify(currentGroups));
+  }, [currentGroups]);
+
+  useEffect(() => {
+    localStorage.setItem('class_quantization_logs', JSON.stringify(logs));
+  }, [logs]);
+
   // Computed data based on selection
   const displayGroups = useMemo(() => {
     if (viewingLogId === 'current') return currentGroups;
@@ -104,85 +56,26 @@ export default function App() {
 
   const isReadOnly = viewingLogId !== 'current';
 
-  // Save to Firestore
-  const saveData = async (groups: Group[]) => {
-    if (!user) return;
-    try {
-      await setDoc(doc(db, 'state', 'current'), {
-        groups,
-        updatedAt: Date.now()
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'state/current');
-    }
+  // Save functions (now just state updates)
+  const saveData = (groups: Group[]) => {
+    setCurrentGroups(groups);
   };
 
-  const addLog = async (type: LogEntry['type'], message: string, data?: Group[]) => {
-    if (!user) return;
-    const newLog = {
+  const addLog = (type: LogEntry['type'], message: string, data?: Group[]) => {
+    const newLog: LogEntry = {
+      id: Date.now().toString(),
       timestamp: Date.now(),
       type,
       message,
       data: data ? JSON.parse(JSON.stringify(data)) : null
     };
-    try {
-      await addDoc(collection(db, 'logs'), newLog);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'logs');
-    }
-  };
-
-  const handleLogin = async () => {
-    try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      console.error("Login failed", err);
-      setError("Google 登录失败，请重试。");
-    }
-  };
-
-  const handleEmailAuth = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setAuthSubmitting(true);
-    
-    try {
-      if (isRegistering) {
-        if (!displayName.trim()) throw new Error("请输入姓名");
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-        await updateProfile(userCredential.user, { displayName: displayName.trim() });
-        // Force refresh user state
-        setUser({ ...userCredential.user, displayName: displayName.trim() });
-      } else {
-        await signInWithEmailAndPassword(auth, email, password);
-      }
-    } catch (err: any) {
-      console.error("Email auth failed", err);
-      let msg = "认证失败，请检查输入。";
-      if (err.code === 'auth/email-already-in-use') msg = "该邮箱已被注册。";
-      if (err.code === 'auth/invalid-email') msg = "邮箱格式不正确。";
-      if (err.code === 'auth/weak-password') msg = "密码太弱（至少6位）。";
-      if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') msg = "邮箱或密码错误。";
-      setError(err.message || msg);
-    } finally {
-      setAuthSubmitting(false);
-    }
-  };
-
-  const handleLogout = async () => {
-    try {
-      await signOut(auth);
-    } catch (err) {
-      console.error("Logout failed", err);
-    }
+    setLogs(prev => [newLog, ...prev].slice(0, 100));
   };
 
   const clearLogs = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (window.confirm("确定要清空所有活动日志吗？")) {
-      // In a real app, we might want to delete from Firestore
-      // For now, we'll just alert that this is an admin action or similar
-      alert("清空日志功能目前仅限管理员手动操作数据库。");
+      setLogs([]);
     }
   };
 
@@ -490,123 +383,8 @@ export default function App() {
     return { keys: sortedKeys, groups };
   }, [allMembersSorted]);
 
-  if (authLoading) {
-    return (
-      <div className="min-h-screen bg-[#fcfaf8] flex items-center justify-center">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
-          <p className="text-slate-500 font-medium">正在加载系统...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!user) {
-    return (
-      <div className="min-h-screen bg-[#fcfaf8] flex items-center justify-center p-4">
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="bg-white p-8 rounded-3xl shadow-2xl border border-slate-200 max-w-md w-full text-center"
-        >
-          <div className="w-16 h-16 bg-indigo-100 rounded-2xl flex items-center justify-center mx-auto mb-6">
-            <Trophy size={32} className="text-indigo-600" />
-          </div>
-          <h1 className="text-2xl font-black text-slate-900 mb-2">班级量化管理系统</h1>
-          <p className="text-slate-500 mb-6">{isRegistering ? '创建一个新账号' : '登录以访问实时系统'}</p>
-          
-          <form onSubmit={handleEmailAuth} className="space-y-4 mb-6">
-            {isRegistering && (
-              <input
-                type="text"
-                placeholder="真实姓名"
-                required
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-sm"
-              />
-            )}
-            <input
-              type="email"
-              placeholder="邮箱地址"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-sm"
-            />
-            <input
-              type="password"
-              placeholder="登录密码 (至少6位)"
-              required
-              minLength={6}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-sm"
-            />
-            <button
-              type="submit"
-              disabled={authSubmitting}
-              className="w-full py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-all font-bold text-sm shadow-lg shadow-indigo-100 disabled:opacity-50"
-            >
-              {authSubmitting ? '处理中...' : (isRegistering ? '立即注册' : '立即登录')}
-            </button>
-          </form>
-
-          <div className="flex items-center gap-4 mb-6">
-            <div className="h-px flex-grow bg-slate-100"></div>
-            <span className="text-[10px] font-bold text-slate-300 uppercase tracking-widest">或者</span>
-            <div className="h-px flex-grow bg-slate-100"></div>
-          </div>
-
-          <button
-            onClick={handleLogin}
-            className="w-full flex items-center justify-center gap-3 px-6 py-3 border border-slate-200 text-slate-600 rounded-xl hover:bg-slate-50 transition-all font-bold text-sm"
-          >
-            <LogIn size={18} /> 使用 Google 账号登录
-          </button>
-
-          <div className="mt-6 text-xs text-slate-400">
-            {isRegistering ? '已有账号？' : '还没有账号？'}
-            <button 
-              onClick={() => setIsRegistering(!isRegistering)}
-              className="ml-1 text-indigo-600 font-bold hover:underline"
-            >
-              {isRegistering ? '去登录' : '去注册'}
-            </button>
-          </div>
-
-          {error && (
-            <div className="mt-4 p-3 bg-rose-50 text-rose-600 rounded-xl text-[11px] flex items-center gap-2 text-left">
-              <AlertCircle size={14} className="flex-shrink-0" /> {error}
-            </div>
-          )}
-        </motion.div>
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen bg-[#fcfaf8] p-4 md:p-8 font-sans text-slate-800 relative">
-      {/* User Info & Logout - Top Right */}
-      <div className="fixed top-4 right-4 z-50 flex items-center gap-3">
-        <div className="bg-white/80 backdrop-blur-md border border-slate-200 rounded-xl shadow-sm p-1.5 flex items-center gap-3">
-          {user.photoURL && (
-            <img src={user.photoURL} alt={user.displayName || ''} className="w-8 h-8 rounded-lg shadow-sm" referrerPolicy="no-referrer" />
-          )}
-          <div className="hidden md:block">
-            <div className="text-[10px] font-bold text-slate-400 leading-none">当前用户</div>
-            <div className="text-xs font-black text-slate-700">{user.displayName}</div>
-          </div>
-          <button 
-            onClick={handleLogout}
-            className="p-2 hover:bg-rose-50 text-slate-400 hover:text-rose-600 rounded-lg transition-all"
-            title="退出登录"
-          >
-            <LogOut size={16} />
-          </button>
-        </div>
-      </div>
-
       {/* Week Selector - Top Left */}
       <div className="fixed top-4 left-4 z-50">
         <div className="bg-white/80 backdrop-blur-md border border-slate-200 rounded-xl shadow-sm p-1 flex items-center gap-2">
