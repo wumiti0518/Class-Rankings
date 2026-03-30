@@ -1,0 +1,68 @@
+{
+  "entities": {
+    "Member": {
+      "title": "Member",
+      "description": "A member of a group",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "score": { "type": "number" },
+        "bonus": { "type": "number" }
+      },
+      "required": ["name", "score", "bonus"]
+    },
+    "Group": {
+      "title": "Group",
+      "description": "A group of members",
+      "type": "object",
+      "properties": {
+        "id": { "type": "number" },
+        "leader": { "type": "string" },
+        "members": {
+          "type": "array",
+          "items": { "$ref": "Member" }
+        }
+      },
+      "required": ["id", "leader", "members"]
+    },
+    "LogEntry": {
+      "title": "LogEntry",
+      "description": "A log entry for an action",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "type": { "type": "string", "enum": ["score", "move", "reset", "leader", "save"] },
+        "message": { "type": "string" },
+        "data": {
+          "type": "array",
+          "items": { "$ref": "Group" }
+        }
+      },
+      "required": ["id", "timestamp", "type", "message"]
+    },
+    "AppState": {
+      "title": "AppState",
+      "description": "The current state of the application",
+      "type": "object",
+      "properties": {
+        "groups": {
+          "type": "array",
+          "items": { "$ref": "Group" }
+        },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["groups", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/state/current": {
+      "schema": "AppState",
+      "description": "The single document holding the current state of all groups"
+    },
+    "/logs/{logId}": {
+      "schema": "LogEntry",
+      "description": "Collection of activity logs"
+    }
+  }
+}
