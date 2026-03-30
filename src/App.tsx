@@ -7,6 +7,11 @@ import { pinyin } from 'pinyin-pro';
 import { supabase } from './lib/supabase';
 
 export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(() => {
+    return sessionStorage.getItem('app_auth') === 'true';
+  });
+  const [passwordInput, setPasswordInput] = useState('');
+
   const [currentGroups, setCurrentGroups] = useState<Group[]>(INITIAL_GROUPS);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -20,6 +25,12 @@ export default function App() {
   const [viewingLogId, setViewingLogId] = useState<string>('current');
   const [newMemberName, setNewMemberName] = useState('');
   const [selectedGroupIdForNewMember, setSelectedGroupIdForNewMember] = useState<number | ''>('');
+
+  // Batch operations state
+  const [isBatchModalOpen, setIsBatchModalOpen] = useState(false);
+  const [batchAction, setBatchAction] = useState<'add' | 'remove' | 'score'>('add');
+  const [batchText, setBatchText] = useState('');
+  const [batchGroupId, setBatchGroupId] = useState<number | ''>('');
 
   // Close menus when clicking outside
   useEffect(() => {
@@ -76,21 +87,25 @@ export default function App() {
   useEffect(() => {
     const channel = supabase.channel('public:all')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state' }, payload => {
-        if (payload.new && payload.new.id === 'main') {
-          setCurrentGroups(payload.new.groups_data);
+        const newRecord = payload.new as { id: string, groups_data: Group[] };
+        if (newRecord && newRecord.id === 'main') {
+          setCurrentGroups(newRecord.groups_data);
         }
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'logs' }, payload => {
         if (payload.eventType === 'INSERT') {
+          const newLog = payload.new as LogEntry;
           setLogs(prev => {
             // Prevent duplicates if optimistic update already added it
-            if (prev.some(log => log.id === payload.new.id)) return prev;
-            return [payload.new as LogEntry, ...prev].sort((a, b) => b.timestamp - a.timestamp).slice(0, 100);
+            if (prev.some(log => log.id === newLog.id)) return prev;
+            return [newLog, ...prev].sort((a, b) => b.timestamp - a.timestamp).slice(0, 100);
           });
         } else if (payload.eventType === 'DELETE') {
-          setLogs(prev => prev.filter(log => log.id !== payload.old.id));
+          const oldLog = payload.old as { id: string };
+          setLogs(prev => prev.filter(log => log.id !== oldLog.id));
         } else if (payload.eventType === 'UPDATE') {
-          setLogs(prev => prev.map(log => log.id === payload.new.id ? payload.new as LogEntry : log));
+          const newLog = payload.new as LogEntry;
+          setLogs(prev => prev.map(log => log.id === newLog.id ? newLog : log));
         }
       })
       .subscribe();
@@ -157,6 +172,22 @@ export default function App() {
       } catch (err: any) {
         console.error('Error clearing logs:', err);
       }
+    }
+  };
+
+  const deleteLog = async (e: React.MouseEvent, logId: string) => {
+    e.stopPropagation();
+    if (!window.confirm("确定要删除这条历史记录吗？")) return;
+    
+    setLogs(prev => prev.filter(l => l.id !== logId));
+    if (viewingLogId === logId) setViewingLogId('current');
+    
+    try {
+      const { error } = await supabase.from('logs').delete().eq('id', logId);
+      if (error) throw error;
+    } catch (err: any) {
+      console.error('Error deleting log:', err);
+      setError('删除失败: ' + err.message);
     }
   };
 
@@ -233,6 +264,79 @@ export default function App() {
       addLog('move', `删除了第 ${groupId} 小组的成员：${memberName}`);
       setMovingMember(null);
     }
+  };
+
+  const handleBatchOperation = () => {
+    if (isReadOnly || !batchText.trim()) return;
+    
+    const newGroups = JSON.parse(JSON.stringify(currentGroups));
+    const lines = batchText.split('\n').map(line => line.trim()).filter(line => line);
+    let logMessage = '';
+
+    if (batchAction === 'add') {
+      if (batchGroupId === '') {
+        alert('请选择要添加成员的小组');
+        return;
+      }
+      const targetGroup = newGroups.find((g: Group) => g.id === batchGroupId);
+      if (!targetGroup) return;
+
+      const addedNames: string[] = [];
+      lines.forEach(name => {
+        targetGroup.members.push({ name, score: 0, bonus: 0 });
+        addedNames.push(name);
+      });
+      logMessage = `向第 ${batchGroupId} 小组批量添加了成员：${addedNames.join(', ')}`;
+    } else if (batchAction === 'remove') {
+      const removedNames: string[] = [];
+      lines.forEach(name => {
+        newGroups.forEach((g: Group) => {
+          const idx = g.members.findIndex((m: Member) => m.name === name);
+          if (idx !== -1) {
+            g.members.splice(idx, 1);
+            removedNames.push(name);
+          }
+        });
+      });
+      if (removedNames.length > 0) {
+        logMessage = `批量删除了成员：${removedNames.join(', ')}`;
+      } else {
+        alert('未找到匹配的成员');
+        return;
+      }
+    } else if (batchAction === 'score') {
+      const updatedNames: string[] = [];
+      lines.forEach(line => {
+        // Parse "Name +5" or "Name -2" or "Name 3"
+        const match = line.match(/^(\S+)\s+([+-]?\d+)$/);
+        if (match) {
+          const name = match[1];
+          const scoreChange = parseInt(match[2], 10);
+          
+          newGroups.forEach((g: Group) => {
+            const member = g.members.find((m: Member) => m.name === name);
+            if (member) {
+              member.score += scoreChange;
+              updatedNames.push(`${name}(${scoreChange > 0 ? '+' : ''}${scoreChange})`);
+            }
+          });
+        }
+      });
+      if (updatedNames.length > 0) {
+        logMessage = `批量更新了成绩：${updatedNames.join(', ')}`;
+      } else {
+        alert('未找到匹配的成员或格式不正确');
+        return;
+      }
+    }
+
+    if (logMessage) {
+      saveData(newGroups);
+      addLog('move', logMessage);
+    }
+    
+    setIsBatchModalOpen(false);
+    setBatchText('');
   };
 
   const renameLog = async (e: React.MouseEvent, logId: string, currentMessage: string) => {
@@ -476,6 +580,55 @@ export default function App() {
     return { keys: sortedKeys, groups };
   }, [allMembersSorted]);
 
+  const handleLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (passwordInput === 'banjilianghua') {
+      setIsAuthenticated(true);
+      sessionStorage.setItem('app_auth', 'true');
+    } else {
+      alert('密码错误，请重试');
+    }
+  };
+
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen bg-[#fcfaf8] flex items-center justify-center font-sans text-slate-800 p-4">
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-white p-8 rounded-2xl shadow-xl max-w-sm w-full border border-slate-100"
+        >
+          <div className="flex justify-center mb-6">
+            <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center">
+              <Trophy className="w-8 h-8 text-indigo-600" />
+            </div>
+          </div>
+          <h2 className="text-2xl font-extrabold text-center text-slate-900 mb-2">班级量化管理系统</h2>
+          <p className="text-center text-slate-500 text-sm mb-8">请输入访问密码以继续</p>
+          
+          <form onSubmit={handleLogin} className="flex flex-col gap-4">
+            <div>
+              <input 
+                type="password" 
+                value={passwordInput} 
+                onChange={e => setPasswordInput(e.target.value)} 
+                placeholder="请输入密码"
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all outline-none text-center tracking-widest"
+                autoFocus
+              />
+            </div>
+            <button 
+              type="submit" 
+              className="w-full bg-indigo-600 text-white font-bold py-3 rounded-xl hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-200"
+            >
+              进入系统
+            </button>
+          </form>
+        </motion.div>
+      </div>
+    );
+  }
+
   if (isLoading) {
     return (
       <div className="min-h-screen bg-[#fcfaf8] flex items-center justify-center font-sans text-slate-800">
@@ -489,6 +642,22 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#fcfaf8] p-4 md:p-8 font-sans text-slate-800 relative">
+      {/* Error Banner */}
+      {error && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[100] bg-red-50 border-l-4 border-red-500 text-red-700 p-4 rounded shadow-lg max-w-md w-full flex justify-between items-start">
+          <div>
+            <p className="font-bold flex items-center gap-2">
+              <AlertCircle className="w-5 h-5" />
+              数据库同步错误
+            </p>
+            <p className="text-sm mt-1">{error}</p>
+          </div>
+          <button onClick={() => setError(null)} className="text-red-500 hover:text-red-700">
+            &times;
+          </button>
+        </div>
+      )}
+
       {/* Status Indicator - Top Right */}
       <div className="fixed top-4 right-4 z-50 flex items-center gap-3">
         <div className="bg-white/80 backdrop-blur-md border border-slate-200 rounded-xl shadow-sm px-3 py-1.5 flex items-center gap-2">
@@ -503,21 +672,42 @@ export default function App() {
           <div className="pl-3 pr-1 py-1">
             <History size={14} className="text-slate-500" />
           </div>
-          <select 
-            value={viewingLogId}
-            onChange={(e) => setViewingLogId(e.target.value)}
-            className="bg-transparent border-none text-xs font-bold text-slate-700 focus:ring-0 cursor-pointer pr-8"
-          >
-            <option value="current">当前实时数据</option>
-            {logs.filter(l => l.type === 'save' && l.data).map(log => (
-              <option key={log.id} value={log.id}>
-                {log.message} ({new Date(log.timestamp).toLocaleDateString()})
-              </option>
-            ))}
-          </select>
+          <div className="relative group flex items-center">
+            <select 
+              value={viewingLogId}
+              onChange={(e) => setViewingLogId(e.target.value)}
+              className="bg-transparent border-none text-xs font-bold text-slate-700 focus:ring-0 cursor-pointer pr-8 appearance-none"
+            >
+              <option value="current">当前实时数据</option>
+              {logs.filter(l => l.type === 'save' && l.data).map(log => (
+                <option key={log.id} value={log.id}>
+                  {log.message} ({new Date(log.timestamp).toLocaleDateString()})
+                </option>
+              ))}
+            </select>
+            <ChevronDown size={14} className="absolute right-2 text-slate-400 pointer-events-none" />
+            
+            {/* Delete button for historical logs */}
+            {viewingLogId !== 'current' && !isReadOnly && (
+              <button 
+                onClick={(e) => deleteLog(e, viewingLogId)}
+                className="ml-2 p-1 text-rose-400 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
+                title="删除此历史记录"
+              >
+                <Trash2 size={14} />
+              </button>
+            )}
+          </div>
           {isReadOnly && (
-            <div className="px-3 py-1 bg-amber-100 text-amber-700 text-[10px] font-bold rounded-lg mr-1 animate-pulse">
-              只读模式
+            <div className="px-3 py-1 bg-amber-100 text-amber-700 text-[10px] font-bold rounded-lg mr-1 animate-pulse flex items-center gap-2">
+              <span>只读模式</span>
+              <button 
+                onClick={(e) => deleteLog(e, viewingLogId)}
+                className="p-0.5 text-amber-600 hover:text-rose-600 hover:bg-rose-50 rounded transition-colors"
+                title="删除此历史记录"
+              >
+                <Trash2 size={12} />
+              </button>
             </div>
           )}
         </div>
@@ -1006,6 +1196,109 @@ export default function App() {
           导出个人 Excel 表格
         </button>
       </footer>
+      {/* Batch Operations Modal */}
+      <AnimatePresence>
+        {isBatchModalOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[200] bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col"
+            >
+              <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                  <FileSpreadsheet size={18} className="text-indigo-600" />
+                  批量操作
+                </h3>
+                <button onClick={() => setIsBatchModalOpen(false)} className="text-slate-400 hover:text-slate-600">
+                  &times;
+                </button>
+              </div>
+              
+              <div className="p-6 flex-1 overflow-y-auto">
+                {/* Tabs */}
+                <div className="flex gap-2 mb-6 bg-slate-100 p-1 rounded-xl">
+                  <button
+                    onClick={() => setBatchAction('add')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${batchAction === 'add' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    批量添加
+                  </button>
+                  <button
+                    onClick={() => setBatchAction('remove')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${batchAction === 'remove' ? 'bg-white text-rose-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    批量删除
+                  </button>
+                  <button
+                    onClick={() => setBatchAction('score')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${batchAction === 'score' ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    批量改分
+                  </button>
+                </div>
+
+                {batchAction === 'add' && (
+                  <div className="mb-4">
+                    <label className="block text-sm font-bold text-slate-700 mb-2">目标小组</label>
+                    <select
+                      value={batchGroupId}
+                      onChange={(e) => setBatchGroupId(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none"
+                    >
+                      <option value="">请选择小组</option>
+                      {currentGroups.map(g => (
+                        <option key={g.id} value={g.id}>第 {g.id} 小组</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-sm font-bold text-slate-700 mb-2">
+                    {batchAction === 'add' && '成员名单 (每行一个姓名)'}
+                    {batchAction === 'remove' && '成员名单 (每行一个姓名)'}
+                    {batchAction === 'score' && '成绩调整 (每行格式：姓名 分数，例如：张三 +5 或 李四 -2)'}
+                  </label>
+                  <textarea
+                    value={batchText}
+                    onChange={(e) => setBatchText(e.target.value)}
+                    placeholder={
+                      batchAction === 'score' 
+                        ? "张三 +5\n李四 -2\n王五 3" 
+                        : "张三\n李四\n王五"
+                    }
+                    className="w-full h-48 p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 outline-none resize-none font-mono text-sm"
+                  ></textarea>
+                </div>
+              </div>
+
+              <div className="px-6 py-4 border-t border-slate-100 bg-slate-50 flex justify-end gap-3">
+                <button
+                  onClick={() => setIsBatchModalOpen(false)}
+                  className="px-4 py-2 text-sm font-bold text-slate-600 hover:bg-slate-200 rounded-xl transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleBatchOperation}
+                  disabled={!batchText.trim() || (batchAction === 'add' && batchGroupId === '')}
+                  className="px-6 py-2 text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-xl shadow-md transition-all"
+                >
+                  确认执行
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
     </div>
   );
 }
