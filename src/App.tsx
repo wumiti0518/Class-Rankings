@@ -4,16 +4,12 @@ import { Trophy, Download, RotateCcw, GripVertical, MoreVertical, UserCog, Send,
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
 import { pinyin } from 'pinyin-pro';
+import { supabase } from './lib/supabase';
 
 export default function App() {
-  const [currentGroups, setCurrentGroups] = useState<Group[]>(() => {
-    const saved = localStorage.getItem('class_quantization_groups');
-    return saved ? JSON.parse(saved) : INITIAL_GROUPS;
-  });
-  const [logs, setLogs] = useState<LogEntry[]>(() => {
-    const saved = localStorage.getItem('class_quantization_logs');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [currentGroups, setCurrentGroups] = useState<Group[]>(INITIAL_GROUPS);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   
   const [draggedMemberInfo, setDraggedMemberInfo] = useState<{ groupId: number; memberIdx: number } | null>(null);
@@ -38,14 +34,71 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Sync to localStorage
+  // Fetch initial data from Supabase
   useEffect(() => {
-    localStorage.setItem('class_quantization_groups', JSON.stringify(currentGroups));
-  }, [currentGroups]);
+    const fetchData = async () => {
+      try {
+        const { data: appState, error: stateError } = await supabase
+          .from('app_state')
+          .select('groups_data')
+          .eq('id', 'main')
+          .single();
+          
+        if (stateError && stateError.code !== 'PGRST116') throw stateError;
+        
+        if (appState && appState.groups_data) {
+          setCurrentGroups(appState.groups_data);
+        }
 
+        const { data: logsData, error: logsError } = await supabase
+          .from('logs')
+          .select('*')
+          .order('timestamp', { ascending: false })
+          .limit(100);
+          
+        if (logsError) throw logsError;
+        
+        if (logsData) {
+          setLogs(logsData);
+        }
+      } catch (err: any) {
+        console.error('Error fetching data:', err);
+        setError(err.message);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchData();
+  }, []);
+
+  // Real-time subscriptions
   useEffect(() => {
-    localStorage.setItem('class_quantization_logs', JSON.stringify(logs));
-  }, [logs]);
+    const channel = supabase.channel('public:all')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state' }, payload => {
+        if (payload.new && payload.new.id === 'main') {
+          setCurrentGroups(payload.new.groups_data);
+        }
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'logs' }, payload => {
+        if (payload.eventType === 'INSERT') {
+          setLogs(prev => {
+            // Prevent duplicates if optimistic update already added it
+            if (prev.some(log => log.id === payload.new.id)) return prev;
+            return [payload.new as LogEntry, ...prev].sort((a, b) => b.timestamp - a.timestamp).slice(0, 100);
+          });
+        } else if (payload.eventType === 'DELETE') {
+          setLogs(prev => prev.filter(log => log.id !== payload.old.id));
+        } else if (payload.eventType === 'UPDATE') {
+          setLogs(prev => prev.map(log => log.id === payload.new.id ? payload.new as LogEntry : log));
+        }
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
 
   // Computed data based on selection
   const displayGroups = useMemo(() => {
@@ -56,12 +109,21 @@ export default function App() {
 
   const isReadOnly = viewingLogId !== 'current';
 
-  // Save functions (now just state updates)
-  const saveData = (groups: Group[]) => {
+  // Save functions (sync to Supabase)
+  const saveData = async (groups: Group[]) => {
     setCurrentGroups(groups);
+    try {
+      const { error } = await supabase
+        .from('app_state')
+        .upsert({ id: 'main', groups_data: groups });
+      if (error) throw error;
+    } catch (err: any) {
+      console.error('Error saving data:', err);
+      setError('保存失败: ' + err.message);
+    }
   };
 
-  const addLog = (type: LogEntry['type'], message: string, data?: Group[]) => {
+  const addLog = async (type: LogEntry['type'], message: string, data?: Group[]) => {
     const newLog: LogEntry = {
       id: Date.now().toString(),
       timestamp: Date.now(),
@@ -69,13 +131,32 @@ export default function App() {
       message,
       data: data ? JSON.parse(JSON.stringify(data)) : null
     };
+    
     setLogs(prev => [newLog, ...prev].slice(0, 100));
+    
+    try {
+      const { error } = await supabase
+        .from('logs')
+        .insert(newLog);
+      if (error) throw error;
+    } catch (err: any) {
+      console.error('Error adding log:', err);
+    }
   };
 
-  const clearLogs = (e: React.MouseEvent) => {
+  const clearLogs = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (window.confirm("确定要清空所有活动日志吗？")) {
       setLogs([]);
+      try {
+        const { error } = await supabase
+          .from('logs')
+          .delete()
+          .neq('id', '0'); // Delete all
+        if (error) throw error;
+      } catch (err: any) {
+        console.error('Error clearing logs:', err);
+      }
     }
   };
 
@@ -154,9 +235,21 @@ export default function App() {
     }
   };
 
-  const renameLog = (e: React.MouseEvent, logId: string, currentMessage: string) => {
+  const renameLog = async (e: React.MouseEvent, logId: string, currentMessage: string) => {
     e.stopPropagation();
-    alert("重命名功能目前仅限管理员手动操作数据库。");
+    const newName = window.prompt("请输入新的名称：", currentMessage);
+    if (newName && newName !== currentMessage) {
+      setLogs(prev => prev.map(log => log.id === logId ? { ...log, message: newName } : log));
+      try {
+        const { error } = await supabase
+          .from('logs')
+          .update({ message: newName })
+          .eq('id', logId);
+        if (error) throw error;
+      } catch (err: any) {
+        console.error('Error renaming log:', err);
+      }
+    }
   };
 
   const handleDragStart = (groupId: number, memberIdx: number) => {
@@ -383,8 +476,27 @@ export default function App() {
     return { keys: sortedKeys, groups };
   }, [allMembersSorted]);
 
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-[#fcfaf8] flex items-center justify-center font-sans text-slate-800">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-8 h-8 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
+          <div className="text-sm font-medium text-slate-500">正在连接数据库...</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#fcfaf8] p-4 md:p-8 font-sans text-slate-800 relative">
+      {/* Status Indicator - Top Right */}
+      <div className="fixed top-4 right-4 z-50 flex items-center gap-3">
+        <div className="bg-white/80 backdrop-blur-md border border-slate-200 rounded-xl shadow-sm px-3 py-1.5 flex items-center gap-2">
+          <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
+          <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">实时同步中</div>
+        </div>
+      </div>
+
       {/* Week Selector - Top Left */}
       <div className="fixed top-4 left-4 z-50">
         <div className="bg-white/80 backdrop-blur-md border border-slate-200 rounded-xl shadow-sm p-1 flex items-center gap-2">
